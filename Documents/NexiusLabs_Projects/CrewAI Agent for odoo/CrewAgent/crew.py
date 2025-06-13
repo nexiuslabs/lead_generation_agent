@@ -19,8 +19,6 @@ answer_agent = Agent(
     verbose=True,
 )
 
-
-
 retrieval_task = Task(
     description="Retrieve relevant snippets for the user question: {question}",
     expected_output="A set of relevant context strings.",
