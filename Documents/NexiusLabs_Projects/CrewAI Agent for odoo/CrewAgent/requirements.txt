@@ -1,0 +1,7 @@
+crewai 
+crewai-tools 
+sentence-transformers 
+psycopg2 
+openai
+fastapi
+uvicorn
