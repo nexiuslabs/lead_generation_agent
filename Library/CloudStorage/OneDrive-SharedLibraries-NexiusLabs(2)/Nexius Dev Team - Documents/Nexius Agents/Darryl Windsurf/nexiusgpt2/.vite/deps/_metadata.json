@@ -1,0 +1,100 @@
+{
+  "hash": "611d0a90",
+  "configHash": "30dc20f4",
+  "lockfileHash": "93624fa6",
+  "browserHash": "b9cf9090",
+  "optimized": {
+    "@reduxjs/toolkit": {
+      "src": "../../node_modules/.pnpm/@reduxjs+toolkit@2.8.2_react-redux@9.2.0_@types+react@18.3.21_react@18.3.1_redux@5.0.1__react@18.3.1/node_modules/@reduxjs/toolkit/dist/redux-toolkit.modern.mjs",
+      "file": "@reduxjs_toolkit.js",
+      "fileHash": "34e5917b",
+      "needsInterop": false
+    },
+    "@reduxjs/toolkit/query": {
+      "src": "../../node_modules/.pnpm/@reduxjs+toolkit@2.8.2_react-redux@9.2.0_@types+react@18.3.21_react@18.3.1_redux@5.0.1__react@18.3.1/node_modules/@reduxjs/toolkit/dist/query/rtk-query.modern.mjs",
+      "file": "@reduxjs_toolkit_query.js",
+      "fileHash": "d8861408",
+      "needsInterop": false
+    },
+    "jwt-decode": {
+      "src": "../../node_modules/.pnpm/jwt-decode@4.0.0/node_modules/jwt-decode/build/esm/index.js",
+      "file": "jwt-decode.js",
+      "fileHash": "3727b1ed",
+      "needsInterop": false
+    },
+    "lodash.debounce": {
+      "src": "../../node_modules/.pnpm/lodash.debounce@4.0.8/node_modules/lodash.debounce/index.js",
+      "file": "lodash__debounce.js",
+      "fileHash": "5bdf4baa",
+      "needsInterop": true
+    },
+    "lucide-react": {
+      "src": "../../node_modules/.pnpm/lucide-react@0.344.0_react@18.3.1/node_modules/lucide-react/dist/esm/lucide-react.js",
+      "file": "lucide-react.js",
+      "fileHash": "ba3c809c",
+      "needsInterop": false
+    },
+    "react": {
+      "src": "../../node_modules/.pnpm/react@18.3.1/node_modules/react/index.js",
+      "file": "react.js",
+      "fileHash": "0fd9633a",
+      "needsInterop": true
+    },
+    "react-dom/client": {
+      "src": "../../node_modules/.pnpm/react-dom@18.3.1_react@18.3.1/node_modules/react-dom/client.js",
+      "file": "react-dom_client.js",
+      "fileHash": "f275c37b",
+      "needsInterop": true
+    },
+    "react-redux": {
+      "src": "../../node_modules/.pnpm/react-redux@9.2.0_@types+react@18.3.21_react@18.3.1_redux@5.0.1/node_modules/react-redux/dist/react-redux.mjs",
+      "file": "react-redux.js",
+      "fileHash": "1deb9452",
+      "needsInterop": false
+    },
+    "react-router-dom": {
+      "src": "../../node_modules/.pnpm/react-router-dom@6.30.0_react-dom@18.3.1_react@18.3.1__react@18.3.1/node_modules/react-router-dom/dist/index.js",
+      "file": "react-router-dom.js",
+      "fileHash": "3b0dab1f",
+      "needsInterop": false
+    },
+    "react-window": {
+      "src": "../../node_modules/.pnpm/react-window@1.8.11_react-dom@18.3.1_react@18.3.1__react@18.3.1/node_modules/react-window/dist/index.esm.js",
+      "file": "react-window.js",
+      "fileHash": "4b17f0b3",
+      "needsInterop": false
+    },
+    "socket.io-client": {
+      "src": "../../node_modules/.pnpm/socket.io-client@4.8.1/node_modules/socket.io-client/build/esm/index.js",
+      "file": "socket__io-client.js",
+      "fileHash": "cdae6893",
+      "needsInterop": false
+    },
+    "uuid": {
+      "src": "../../node_modules/.pnpm/uuid@11.1.0/node_modules/uuid/dist/esm-browser/index.js",
+      "file": "uuid.js",
+      "fileHash": "71e5d5ea",
+      "needsInterop": false
+    },
+    "react/jsx-dev-runtime": {
+      "src": "../../node_modules/.pnpm/react@18.3.1/node_modules/react/jsx-dev-runtime.js",
+      "file": "react_jsx-dev-runtime.js",
+      "fileHash": "3ee5228c",
+      "needsInterop": true
+    }
+  },
+  "chunks": {
+    "chunk-DIMNS5TJ": {
+      "file": "chunk-DIMNS5TJ.js"
+    },
+    "chunk-IM3RSAW5": {
+      "file": "chunk-IM3RSAW5.js"
+    },
+    "chunk-YF6YTEQP": {
+      "file": "chunk-YF6YTEQP.js"
+    },
+    "chunk-DC5AMYBS": {
+      "file": "chunk-DC5AMYBS.js"
+    }
+  }
+}

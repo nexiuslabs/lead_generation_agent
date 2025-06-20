@@ -1,0 +1,105 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  /* Custom scrollbar */
+  ::-webkit-scrollbar {
+    width: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: #f1f1f1;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #888;
+    border-radius: 4px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #555;
+  }
+
+  .dark ::-webkit-scrollbar-track {
+    background: #1e1e1e;
+  }
+  .dark ::-webkit-scrollbar-thumb {
+    background: #444;
+  }
+  .dark ::-webkit-scrollbar-thumb:hover {
+    background: #666;
+  }
+
+  @keyframes typing {
+    0% { content: ''; }
+    25% { content: '.'; }
+    50% { content: '..'; }
+    75% { content: '...'; }
+  }
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+}
+
+@layer components {
+  /* Typing animation for the assistant message */
+  .typing-animation {
+    display: inline-block;
+    width: 20px;
+    text-align: left;
+    animation: typing 1.5s infinite;
+  }
+
+  /* Animation utilities */
+  .animate-fade-in {
+    animation: fadeIn 0.3s ease-out forwards;
+  }
+
+  /* Vertical text for collapsed preview */
+  .writing-vertical {
+    writing-mode: vertical-lr;
+  }
+
+  /* Focus styles for accessibility */
+  *:focus-visible {
+    outline: 2px solid theme('colors.primary.500');
+    outline-offset: 2px;
+    @apply rounded-sm;
+  }
+  .dark *:focus-visible {
+    outline-color: theme('colors.secondary.500');
+  }
+
+  /* Keyboard shortcut indicator */
+  .shortcut {
+    @apply inline-flex items-center justify-center px-1.5 py-0.5 text-xs font-medium bg-gray-200 rounded border border-gray-300;
+  }
+  .dark .shortcut {
+    @apply bg-dark-secondary border-dark-tertiary;
+  }
+
+  /* Special message types */
+  .message.bot-message .metadata-summary {
+    font-style: italic;
+    color: #555;
+  }
+  .dark .message.bot-message .metadata-summary {
+    color: #aaa;
+  }
+
+  /* Styling for message status indicators */
+  .message-sending {
+    opacity: 0.7;
+  }
+  .message-error {
+    border-left: 3px solid #ef4444;
+  }
+}
+
+@layer utilities {
+  .text-shadow {
+    text-shadow: 0 1px 2px rgba(0,0,0,0.1);
+  }
+  .text-shadow-none {
+    text-shadow: none;
+  }
+}
