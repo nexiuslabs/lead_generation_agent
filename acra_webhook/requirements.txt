@@ -1,0 +1,11 @@
+requests
+sqlalchemy
+apscheduler
+uvicorn
+fastapi
+python-dotenv
+psycopg2-binary
+pydantic
+pydantic-settings
+
+pytest

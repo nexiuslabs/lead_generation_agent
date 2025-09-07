@@ -1,0 +1,826 @@
+Development Plan — 6) Multi‑Tenant, SSO & Odoo Integration
+
+Scope
+- Implement Section 6 of PRD across repos: agent-chat-ui, lead_generation-main, acra_webhook, and Odoo setup. Align identity, tenancy, and first‑login auto‑provisioning.
+
+Outcomes
+- SSO-only auth via Nexius SSO (OIDC). No local credentials in production.
+- JWT validation server-side; tenant_id + roles extracted and enforced.
+- First-login auto-provisioning creates tenant, odoo_connections, and seeds Odoo.
+- UI shows authenticated user + tenant; provisioning status; no tenant switcher in prod.
+
+SSO Setup Checklist (NextAuth + Nexius SSO)
+- Register an OIDC client in your Nexius SSO (IdP admin console):
+  - Name: agent-chat-ui (any name)
+  - Type: Confidential client (has a client secret)
+  - Scopes: openid profile email
+  - Redirect URIs:
+    - http://localhost:3000/api/auth/callback/nexius
+    - http://127.0.0.1:3000/api/auth/callback/nexius
+    - https://YOUR_UI_DOMAIN/api/auth/callback/nexius
+  - Post-logout redirect URIs:
+    - http://localhost:3000
+    - https://YOUR_UI_DOMAIN
+  - ID token claims (map from your directory attributes/roles):
+    - email: standard claim
+    - tenant_id: custom claim (string/int) → maps user’s tenant/organization
+    - roles: array (admin/ops/viewer) → JSON array claim
+  - Copy values for app config:
+    - Issuer URL (well-known): NEXIUS_ISSUER (e.g., https://sso.nexius.example or Keycloak realm URL)
+    - Client ID: NEXIUS_CLIENT_ID
+    - Client Secret: NEXIUS_CLIENT_SECRET
+
+- Configure env for UI (agent-chat-ui):
+  - NEXTAUTH_URL=http://localhost:3000
+  - NEXTAUTH_SECRET=<openssl rand -base64 32>
+  - NEXIUS_ISSUER=https://sso.nexius.example
+  - NEXIUS_CLIENT_ID=<from SSO>
+  - NEXIUS_CLIENT_SECRET=<from SSO>
+  - NEXT_PUBLIC_API_BASE=http://localhost:2024
+
+- Configure env for API (lead_generation-main):
+  - NEXIUS_ISSUER=https://sso.nexius.example
+  - NEXIUS_AUDIENCE=<optional; set if your IdP includes aud and you want to enforce it>
+  - Ensure JWKS is reachable at: ${NEXIUS_ISSUER}/.well-known/jwks.json
+
+- Callback path note: Provider id is "nexius" → NextAuth callback must be whitelisted at /api/auth/callback/nexius in the IdP client.
+
+- Dev options if SSO not available yet:
+  - Use existing dev-only Credentials provider in UI (do not enable in production).
+  - Or run a local OIDC (Keycloak) for testing:
+    - docker run -p 8080:8080 -e KEYCLOAK_ADMIN=admin -e KEYCLOAK_ADMIN_PASSWORD=admin quay.io/keycloak/keycloak:24.0 start-dev
+    - Create realm, then OIDC client "agent-chat-ui", add redirect URIs above.
+    - Set NEXIUS_ISSUER=http://localhost:8080/realms/<realm>, create client secret, set in env.
+
+SSO Setup Guide (Admin Console Steps)
+
+Keycloak (recommended / likely for Nexius SSO)
+- Access admin: https://<your-sso-host> → Keycloak Admin → select your Realm (or create one).
+- Create client: Clients → Create client → Client type: OpenID Connect → Client ID: agent-chat-ui → Next.
+- Enable flows: Turn ON “Client authentication” and “Standard flow” (Authorization Code) → Save.
+- Configure redirects:
+  - Valid redirect URIs:
+    - http://localhost:3000/api/auth/callback/nexius
+    - http://127.0.0.1:3000/api/auth/callback/nexius
+    - https://YOUR_UI_DOMAIN/api/auth/callback/nexius
+  - Post-logout redirect URIs:
+    - http://localhost:3000
+    - https://YOUR_UI_DOMAIN
+  - Web origins: add http://localhost:3000 and your production origin (or use “+” to allow from redirect URIs).
+- Credentials: Clients → your client → Credentials → copy Client Secret → NEXIUS_CLIENT_SECRET.
+- Issuer: Realm settings → OpenID Endpoints → copy Issuer → NEXIUS_ISSUER (e.g., https://sso.example/realms/<realm>).
+- Client ID: Clients → your client → copy Client ID → NEXIUS_CLIENT_ID.
+- Claims mapping (ID token):
+  - Ensure “email” scope is included (default profile/email scopes).
+  - tenant_id: Clients → your client → Client scopes → Mappers → Create → Mapper type: User Attribute.
+    - Name: tenant_id; User Attribute: tenant_id; Token Claim Name: tenant_id; Add to ID token: On; JSON type: String.
+    - For testing, set Users → select a user → Attributes → add tenant_id.
+  - roles: Clients → your client → Client scopes → Mappers → Create → Mapper type: User Client Role (or User Realm Role).
+    - Token Claim Name: roles; Add to ID token: On; Multivalued/JSON array: On.
+- Test: Start UI with env vars set; sign in and decode id_token to verify email, tenant_id, roles.
+
+Okta (alternative)
+- Admin → Applications → Create App Integration → OIDC - Web Application.
+- Redirect URIs: http://localhost:3000/api/auth/callback/nexius, https://YOUR_UI_DOMAIN/api/auth/callback/nexius.
+- Logout URIs: http://localhost:3000, https://YOUR_UI_DOMAIN.
+- Assign test user/group to the app.
+- Claims:
+  - Security → API → Authorization Servers → default → Claims → Add claim “tenant_id” with Value user.profile.tenant_id; include in ID token.
+  - Roles: use “groups” claim with filter or add custom “roles” claim mapping groups to strings.
+- Copy Issuer (Authorization Server → Settings) to NEXIUS_ISSUER and Client ID/Secret to NEXIUS_CLIENT_ID/SECRET.
+
+Auth0 (alternative)
+- Dashboard → Applications → Applications → Create Application → Regular Web App.
+- Allowed Callback URLs: http://localhost:3000/api/auth/callback/nexius, https://YOUR_UI_DOMAIN/api/auth/callback/nexius.
+- Allowed Logout URLs: http://localhost:3000, https://YOUR_UI_DOMAIN.
+- Add custom claims via Actions/Rules into ID token: tenant_id and roles.
+- Copy Domain (issuer) to NEXIUS_ISSUER (https://YOUR_DOMAIN/), and Client ID/Secret.
+
+Local development (no SSO yet)
+- Run Keycloak locally:
+  - docker run -p 8080:8080 -e KEYCLOAK_ADMIN=admin -e KEYCLOAK_ADMIN_PASSWORD=admin quay.io/keycloak/keycloak:24.0 start-dev
+  - Create realm “nexius-dev”; create OIDC client “agent-chat-ui”; add redirect URIs above.
+  - Set env: NEXIUS_ISSUER=http://localhost:8080/realms/nexius-dev; obtain client secret and set NEXIUS_CLIENT_SECRET.
+- Or use the UI’s dev-only Credentials provider temporarily (never in production).
+
+SSO Env Examples (copy/paste)
+
+Dev (.env.local for agent-chat-ui)
+"""
+NEXTAUTH_URL=http://localhost:3000
+NEXTAUTH_SECRET=REPLACE_WITH_openssl_rand_base64_32
+NEXIUS_ISSUER=http://localhost:8080/realms/nexius-dev
+NEXIUS_CLIENT_ID=agent-chat-ui
+NEXIUS_CLIENT_SECRET=REPLACE_WITH_CLIENT_SECRET
+NEXT_PUBLIC_API_BASE=http://localhost:2024
+NEXT_PUBLIC_ENABLE_TENANT_SWITCHER=true
+"""
+
+Dev (.env for lead_generation-main)
+"""
+POSTGRES_DSN=postgresql://postgres:pass@localhost:5432/leadgen
+NEXIUS_ISSUER=http://localhost:8080/realms/nexius-dev
+NEXIUS_AUDIENCE=
+ALLOW_DEV_BYPASS=1
+LANGGRAPH_CHECKPOINT_DIR=.langgraph_api
+"""
+
+Prod (agent-chat-ui)
+"""
+NEXTAUTH_URL=https://YOUR_UI_DOMAIN
+NEXTAUTH_SECRET=REPLACE_WITH_SECURE_RANDOM
+NEXIUS_ISSUER=https://sso.nexius.example/realms/prod
+NEXIUS_CLIENT_ID=agent-chat-ui
+NEXIUS_CLIENT_SECRET=REPLACE_WITH_CLIENT_SECRET
+NEXT_PUBLIC_API_BASE=https://YOUR_API_DOMAIN
+NEXT_PUBLIC_ENABLE_TENANT_SWITCHER=false
+"""
+
+Prod (lead_generation-main)
+"""
+POSTGRES_DSN=postgresql://user:pass@dbhost:5432/leadgen
+NEXIUS_ISSUER=https://sso.nexius.example/realms/prod
+NEXIUS_AUDIENCE=
+"""
+
+SSO Testing & Verification
+- Decode token: After login, open DevTools → Application → Cookies → find `next-auth.session-token` or inspect `session.idToken` via console and decode at https://jwt.io. Verify claims: `email`, `tenant_id`, `roles`.
+- JWKS check: Open `${NEXIUS_ISSUER}/.well-known/jwks.json` in a browser; it must return a valid JSON with keys.
+- Callback whitelisting: Ensure `/api/auth/callback/nexius` is present in the IdP client Allowed Redirect URIs.
+- Audience (aud) issues: If your IdP sets `aud`, set `NEXIUS_AUDIENCE` in the API; if not used, leave empty to skip audience verification.
+- CORS: API allows `http://localhost:3000` by default. Add your production UI origin to CORS allowlist if deploying.
+
+E2E Smoke Procedure
+1) Start API (lead_generation-main) with env above → visit `http://localhost:2024/docs` (health open, others require auth).
+2) Start UI (agent-chat-ui) → navigate to `http://localhost:3000` → you should be redirected to Nexius SSO login.
+3) Sign in → UI loads header with email and tenant; FirstLoginGate calls `/onboarding/first_login` and polls `/onboarding/status` until ready.
+4) Call API exports with Authorization header (UI does this automatically). Confirm only tenant-scoped data returned.
+
+Troubleshooting
+- 401 on API: Missing/expired token. UI should auto `signIn()` on 401; otherwise check `session.idToken` is present and Authorization header is sent.
+- 403 Missing tenant_id claim: Configure the `tenant_id` mapper in your IdP, or set a dev override via `X-Tenant-ID` when `ALLOW_DEV_BYPASS=1` (dev only).
+- NextAuth callback error: Check Redirect URIs, `NEXTAUTH_URL`, and provider id (`nexius`) consistency.
+- Clock skew: Ensure SSO and servers have correct time (NTP), otherwise tokens may be considered not yet valid/expired.
+- Mixed domains/cookies: For production behind HTTPS, ensure secure cookies and correct domain in `NEXTAUTH_URL`.
+
+
+Environment & Prerequisites
+- Required env (global):
+  - POSTGRES_DSN: PostgreSQL DSN to app DB
+  - NEXIUS_ISSUER: e.g., https://sso.nexius.example
+  - NEXIUS_AUDIENCE: audience for JWT validation (if configured on IdP)
+  - OPENAI_API_KEY, TAVILY_API_KEY?, ZEROBOUNCE_API_KEY?, LUSHA_API_KEY?
+- UI (agent-chat-ui): NEXTAUTH_URL, NEXTAUTH_SECRET, NEXIUS_CLIENT_ID, NEXIUS_CLIENT_SECRET, NEXIUS_ISSUER, NEXT_PUBLIC_API_BASE=http://localhost:2024
+- API (lead_generation-main): NEXIUS_ISSUER, NEXIUS_AUDIENCE, DEFAULT_TENANT_ID (dev-only), LANGGRAPH_CHECKPOINT_DIR
+- Odoo: ODOO_POSTGRES_DSN or per-tenant odoo_connections as in migrations/004_multi_tenant_icp.sql
+
+Database Setup
+- Apply base schema: psql "$POSTGRES_DSN" -f schema_PosgresDB.sql
+- Apply app migrations (at minimum):
+  - lead_generation-main/app/migrations/004_multi_tenant_icp.sql
+  - lead_generation-main/app/migrations/001_presdr_odoo.sql
+  - lead_generation-main/app/migrations/005_tenant_rls.sql (if present; enables RLS/tenant filters)
+
+agent-chat-ui (Next.js) — Identity & UX
+1) SSO-only NextAuth configuration
+  - Ensure OIDC provider is enabled when NEXIUS_* envs present (already in src/app/api/auth/[...nextauth]/route.ts).
+  - Keep Credentials provider strictly dev-only fallback. Add production guard:
+    - If NODE_ENV=production and OIDC envs are missing → error at startup (fail fast), do not enable Credentials.
+  - Ensure profile mapping captures claims: email, tenant_id (from standard claim or custom), roles[].
+
+2) Session & headers to API
+  - Surface id_token in session (already in callbacks). On API calls, attach Authorization: Bearer <id_token> for server endpoints.
+  - Centralize a fetch wrapper that always includes Authorization header and retries on 401 by triggering signIn().
+
+3) Auth guard & routing
+  - Add middleware/guards to redirect unauthenticated users to signIn("nexius").
+  - Enforce no tenant switcher in production: NEXT_PUBLIC_ENABLE_TENANT_SWITCHER=false.
+
+4) First-login provisioning UX
+  - On first authenticated mount: call API POST /onboarding/first_login.
+  - If response.status in {provisioning, syncing}: show “Setting up your workspace…”. Poll /onboarding/status until ready.
+  - Once ready, show app normally.
+
+5) Header UI
+  - Display user email and active tenantId from session.
+  - Provide signOut() that clears session and SSO (global logout endpoint).
+
+6) Tests (UI)
+  - Dev: with Credentials provider, ensure session carries tenantId/roles; pages load.
+  - Prod-like: with NEXIUS_* configured, verify redirect to IdP and callback succeeds (manual/integration).
+
+lead_generation-main (FastAPI + LangGraph) — Auth, Tenancy, Provisioning
+1) JWT validation & middleware
+  - app/auth.py already validates JWT via JWKS at NEXIUS_ISSUER. Add:
+    - Caching JWKS (lru_cache present) and short circuit on failures with 5xx.
+    - Configurable audience (NEXIUS_AUDIENCE) optional.
+  - app/main.py middleware auth_guard already sets request.state.tenant_id from JWT and allows health/docs; keep Dev X-Tenant-ID only when ALLOW_DEV_BYPASS=1.
+
+2) Tenant scoping
+  - On each DB request path that uses a connection/pool, set Postgres GUC: SELECT set_config('request.tenant_id', $1, true) to leverage RLS/policies.
+  - Ensure all tenant-owned tables include tenant_id and have policies (005_tenant_rls.sql).
+
+3) Role-based authorization
+  - Map roles[] claim to permissions:
+    - ops/admin: can update ICP rules, run orchestrator.
+    - viewer: read-only endpoints (export, whoami, etc.).
+  - Enforce in handlers via roles check from request.state.roles.
+
+4) First-login auto-provisioning
+  - New endpoints:
+    - POST /onboarding/first_login → idempotent. If signer has no tenant:
+      1) Create tenants row with defaults (ICP template, quotas).
+      2) Initialize odoo_connections for the tenant (multi-tenant DB or single instance mapping).
+      3) Create/link Odoo user for email; assign default roles.
+      4) Kick off initial sync (lightweight smoke + baseline entities).
+      5) Return {status: provisioning|syncing|ready, tenant_id}.
+    - GET /onboarding/status → returns current onboarding state and any error info.
+  - Persist onboarding state per tenant (provisioning → syncing → ready), surface via API.
+
+5) Odoo alignment (app/odoo_store.py)
+  - Add helpers:
+    - ensure_tenant_db_or_company(tenant_id) → create per-tenant DB/schema or company record on single instance.
+    - register_service_account(tenant_id) → store in odoo_connections with auth_type+secret.
+    - connectivity_smoke_test(tenant_id) → read/write check.
+  - Ensure Odoo connection resolution uses odoo_connections by tenant_id.
+
+6) Exports & SSE
+  - Keep /export/latest_scores.(json|csv) guarded by JWT and tenant-scoped via GUC.
+  - For streaming endpoints (SSE), refresh Authorization headers on reconnect.
+
+7) Tests (API)
+  - whoami returns email, tenant_id, roles from JWT.
+  - With two tokens (A/B), export endpoints return only A or B rows respectively.
+  - First-login endpoints create tenant + odoo_connections, status transitions to ready (using a mocked Odoo backend in tests if needed).
+
+acra_webhook — ACRA ingestion
+1) Auth & tenancy
+  - No SSO required; service runs server-side and writes to staging_acra_companies (tenant-agnostic staging).
+  - Confirm base table exists (schema_PosgresDB.sql). Upserts by UEN.
+
+2) Scheduling
+  - Keep APScheduler; allow DISABLE_SCHEDULER=1 and INTERVAL_SECONDS for interval mode.
+
+3) Observability
+  - Log ingestion counts and page cursors; on failure, include retry guidance.
+
+4) Tests
+  - Health check endpoint; dry-run ingestion against a test DB.
+
+Odoo — SSO & per‑tenant mapping
+1) Configure OIDC in Odoo (see lead_generation-main/docs/odoo_oidc_setup.md)
+  - Register Nexius SSO client: issuer=NEXIUS_ISSUER, client_id/secret.
+  - Map ID token claims: email, tenant_id, roles (custom claim if needed).
+  - Verify login with SSO works and reflects identity.
+
+2) Per-tenant DB/company
+  - Multi-tenant Odoo: create database/schema per tenant and store routing in odoo_connections.
+  - Single Odoo instance: create company or child records; store scoped API key/service account per tenant in odoo_connections.
+
+3) Smoke tests
+  - From API, run connectivity_smoke_test after provisioning and persist ready status.
+
+Security & Compliance
+- SSO-only in production; no local login or passwords handled by UI.
+- HTTPS + secure cookies; CSRF/SameSite appropriate for NextAuth.
+- Server never exposes Odoo secrets to the browser; server-side only.
+- RLS + role checks; log audit fields with tenant_id and sub/email when applicable.
+
+Operational Runbook
+- Onboard a new external user:
+  1) User hits UI → SSO → returns JWT with email/tenant_id (or no tenant yet).
+  2) UI calls POST /onboarding/first_login; API provisions tenant + Odoo mapping.
+  3) UI polls GET /onboarding/status until ready.
+- Rotate SSO credentials: update NEXIUS_CLIENT_SECRET in UI and Odoo; no code changes.
+- Expired tokens: UI triggers signIn on 401; server rejects with 401/403.
+
+Acceptance Checklist (Section 6)
+- UI requires Nexius SSO; session shows tenant_id; no tenant switcher in prod.
+- API rejects unauthenticated; validates JWT via JWKS; enforces RLS via tenant GUC.
+- First-login to ready ≤ 60s p95; odoo_connections row exists and passes smoke test.
+- Single sign-on across UI + Odoo in same browser session.
+
+Delivery Steps
+1) UI
+  - Add production guard to disallow Credentials provider.
+  - Implement API fetch wrapper with Authorization header.
+  - First-login call + provisioning status UI.
+
+2) API
+  - Harden auth middleware; finalize onboarding endpoints and state model.
+  - Implement Odoo setup helpers and smoke tests.
+  - Ensure tenant GUC set before DB queries on protected endpoints.
+
+3) DB
+  - Apply migrations; verify RLS policies active; seed minimal ICP template per tenant on creation.
+
+4) ACRA
+  - Confirm staging ingestion stable; document schedule; add logs.
+
+5) Odoo
+  - Configure IdP; create client; test login; document per-tenant strategy used (DB-per-tenant vs single-instance company records).
+
+Dev/Prod Config Matrix
+- Development
+  - UI: Credentials fallback enabled, NEXT_PUBLIC_ENABLE_TENANT_SWITCHER=true, DEFAULT_TENANT_ID set on API for convenience.
+  - API: ALLOW_DEV_BYPASS=1 to allow X-Tenant-ID when no JWT.
+- Production
+  - UI: OIDC required; no Credentials; tenant switcher disabled.
+  - API: JWT required on all protected endpoints; X-Tenant-ID ignored.
+
+Post-merge Verification
+- Manual walk-through with real SSO: login, first-login provisioning, Odoo smoke, run one enrichment cycle, export CSV.
+- Ensure logs include tenant_id and user where applicable.
+
+Full Code Changes (by codebase and file path)
+
+Note: The following are complete file contents or additive files to implement Section 6. Do not mix production and dev fallbacks. In production, Credentials provider must be disabled and OIDC required. Apply only the changes relevant to your environment.
+
+agent-chat-ui (Next.js UI)
+
+1) File: agent-chat-ui/src/app/api/auth/[...nextauth]/route.ts
+
+Replace file with:
+
+"""
+import NextAuth from "next-auth";
+import Credentials from "next-auth/providers/credentials";
+import { Issuer } from "openid-client";
+
+async function buildProviders() {
+  const providers: any[] = [];
+  const issuerUrl = process.env.NEXIUS_ISSUER;
+  const cid = process.env.NEXIUS_CLIENT_ID;
+  const secret = process.env.NEXIUS_CLIENT_SECRET;
+  if (issuerUrl && cid && secret) {
+    try {
+      const discovered = await Issuer.discover(issuerUrl);
+      providers.push({
+        id: "nexius",
+        name: "Nexius",
+        type: "oauth",
+        version: "2.0",
+        idToken: true,
+        checks: ["pkce", "state"],
+        authorization: { params: { scope: "openid profile email" } },
+        clientId: cid,
+        clientSecret: secret,
+        issuer: discovered.issuer,
+        wellKnown: `${discovered.issuer}/.well-known/openid-configuration`,
+        profile(profile: any) {
+          return { id: profile.sub, email: profile.email } as any;
+        },
+      });
+    } catch (e) {
+      console.warn(
+        "Nexius OIDC discovery failed; falling back to dev credentials login.",
+        e
+      );
+    }
+  }
+  if (providers.length === 0) {
+    // Dev-only fallback to unblock local development when SSO env is not set
+    if (process.env.NODE_ENV === "production") {
+      throw new Error(
+        "Nexius SSO (OIDC) is not configured in production. Set NEXIUS_ISSUER, NEXIUS_CLIENT_ID, NEXIUS_CLIENT_SECRET."
+      );
+    }
+    providers.push(
+      Credentials({
+        name: "Dev Login",
+        credentials: {
+          email: { label: "Email", type: "email" },
+          tenant: { label: "Tenant ID", type: "text" },
+        },
+        async authorize(creds) {
+          const email = (creds as any)?.email;
+          const tenant = (creds as any)?.tenant || "dev";
+          if (!email) return null;
+          return { id: email, email, tenant_id: tenant } as any;
+        },
+      })
+    );
+  }
+  return providers;
+}
+
+const handler = NextAuth({
+  providers: await buildProviders(),
+  session: { strategy: "jwt" },
+  trustHost: true,
+  callbacks: {
+    async jwt({ token, account, profile }) {
+      if (account?.id_token) (token as any).id_token = account.id_token;
+      // Map from OIDC profile or Credentials user
+      const anyProf: any = profile as any;
+      if (anyProf) {
+        (token as any).tenant_id =
+          anyProf.tenant_id ??
+          anyProf["https://claims/tenant_id"] ??
+          (token as any).tenant_id ??
+          null;
+        (token as any).roles =
+          anyProf.roles ?? anyProf["https://claims/roles"] ?? (token as any).roles ?? [];
+      }
+      return token;
+    },
+    async session({ session, token }) {
+      (session as any).idToken = (token as any).id_token;
+      (session as any).tenantId = (token as any).tenant_id ?? null;
+      (session as any).roles = (token as any).roles ?? [];
+      return session;
+    },
+  },
+});
+
+export { handler as GET, handler as POST };
+"""
+
+2) File: agent-chat-ui/src/lib/useAuthFetch.ts
+
+Add new file:
+
+"""
+"use client";
+
+import { useSession, signIn } from "next-auth/react";
+
+export function useAuthFetch() {
+  const { data: session } = useSession();
+  const idToken = (session as any)?.idToken as string | undefined;
+  const sessionTenantId = (session as any)?.tenantId as string | undefined;
+  const enabled = (process.env.NEXT_PUBLIC_ENABLE_TENANT_SWITCHER || "").toLowerCase() === "true";
+
+  function tenantOverride(): string | undefined {
+    if (!enabled) return sessionTenantId;
+    try {
+      const v = window.localStorage.getItem("lg:chat:tenantId");
+      return v || sessionTenantId;
+    } catch {
+      return sessionTenantId;
+    }
+  }
+
+  return async function authFetch(input: RequestInfo | URL, init: RequestInit = {}) {
+    const headers = new Headers(init.headers || {});
+    const tid = tenantOverride();
+    if (idToken) headers.set("Authorization", `Bearer ${idToken}`);
+    if (tid) headers.set("X-Tenant-ID", tid);
+    const res = await fetch(input, { ...init, headers });
+    if (res.status === 401) {
+      // Token invalid/expired → retry via SSO
+      void signIn(undefined, { callbackUrl: "/" });
+    }
+    return res;
+  };
+}
+"""
+
+3) File: agent-chat-ui/src/components/onboarding/FirstLoginGate.tsx
+
+Add new file:
+
+"""
+"use client";
+
+import React, { useEffect, useMemo, useState } from "react";
+import { useSession } from "next-auth/react";
+import { useAuthFetch } from "@/lib/useAuthFetch";
+
+type Status = "unknown" | "provisioning" | "syncing" | "ready" | "error";
+
+export function FirstLoginGate({ children }: { children: React.ReactNode }) {
+  const apiBase = useMemo(() => process.env.NEXT_PUBLIC_API_BASE || "http://localhost:2024", []);
+  const { status } = useSession();
+  const authFetch = useAuthFetch();
+  const [state, setState] = useState<{ status: Status; error?: string }>({ status: "unknown" });
+
+  useEffect(() => {
+    if (status !== "authenticated") return;
+    let cancelled = false;
+
+    async function kickOff() {
+      try {
+        const res = await authFetch(`${apiBase}/onboarding/first_login`, { method: "POST" });
+        const body = await res.json().catch(() => ({}));
+        if (!cancelled) setState({ status: (body.status as Status) || "provisioning" });
+      } catch (e: any) {
+        if (!cancelled) setState({ status: "error", error: String(e) });
+      }
+    }
+    kickOff();
+
+    const iv = setInterval(async () => {
+      try {
+        const res = await authFetch(`${apiBase}/onboarding/status`);
+        const body = await res.json();
+        if (!cancelled) setState({ status: (body.status as Status) || "provisioning", error: body.error });
+        if (body.status === "ready") clearInterval(iv);
+      } catch (e: any) {
+        if (!cancelled) setState({ status: "error", error: String(e) });
+      }
+    }, 2000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(iv);
+    };
+  }, [status, apiBase, authFetch]);
+
+  if (status !== "authenticated") return <div />;
+  if (state.status === "ready") return <>{children}</>;
+
+  return (
+    <div className="w-full h-[60vh] flex items-center justify-center">
+      <div className="text-center space-y-2">
+        <div className="text-lg font-medium">Setting up your workspace…</div>
+        <div className="text-sm text-muted-foreground">
+          {state.status === "provisioning" && "Provisioning tenant and Odoo mapping"}
+          {state.status === "syncing" && "Running connectivity checks and seeding entities"}
+          {state.status === "error" && (state.error || "Unknown error")}
+        </div>
+      </div>
+    </div>
+  );
+}
+"""
+
+4) File: agent-chat-ui/src/app/page.tsx
+
+Replace file with:
+
+"""
+"use client";
+
+import { Thread } from "@/components/thread";
+import { StreamProvider } from "@/providers/Stream";
+import { ThreadProvider } from "@/providers/Thread";
+import { ArtifactProvider } from "@/components/thread/artifact";
+import { Toaster } from "@/components/ui/sonner";
+import React from "react";
+import { useSession, signIn } from "next-auth/react";
+import { useEffect } from "react";
+import HeaderBar from "@/components/ui/header-bar";
+import { FirstLoginGate } from "@/components/onboarding/FirstLoginGate";
+
+export default function DemoPage(): React.ReactNode {
+  const { status } = useSession();
+  useEffect(() => {
+    if (status === "unauthenticated") {
+      void signIn("nexius", { callbackUrl: "/" });
+    }
+  }, [status]);
+  if (status === "loading") {
+    return <div />;
+  }
+  if (status === "unauthenticated") {
+    return <div />;
+  }
+  return (
+    <React.Suspense fallback={<div>Loading (layout)...</div>}>
+      <HeaderBar />
+      <Toaster />
+      <FirstLoginGate>
+        <ThreadProvider>
+          <StreamProvider>
+            <ArtifactProvider>
+              <Thread />
+            </ArtifactProvider>
+          </StreamProvider>
+        </ThreadProvider>
+      </FirstLoginGate>
+    </React.Suspense>
+  );
+}
+"""
+
+lead_generation-main (FastAPI + LangGraph API)
+
+1) File: lead_generation-main/app/onboarding.py
+
+Add new file:
+
+"""
+import os
+from typing import Optional, Tuple
+import asyncpg
+from src.database import get_conn
+from app.odoo_store import OdooStore
+
+ONBOARDING_READY = "ready"
+ONBOARDING_PROVISIONING = "provisioning"
+ONBOARDING_SYNCING = "syncing"
+ONBOARDING_ERROR = "error"
+
+def _ensure_tables():
+  with get_conn() as conn, conn.cursor() as cur:
+    cur.execute(
+      """
+      CREATE TABLE IF NOT EXISTS onboarding_status (
+        tenant_id INT PRIMARY KEY REFERENCES tenants(tenant_id) ON DELETE CASCADE,
+        status TEXT NOT NULL,
+        error TEXT,
+        updated_at TIMESTAMPTZ DEFAULT now()
+      );
+      """
+    )
+
+def _insert_or_update_status(tenant_id: int, status: str, error: Optional[str] = None):
+  with get_conn() as conn, conn.cursor() as cur:
+    cur.execute(
+      """
+      INSERT INTO onboarding_status(tenant_id, status, error, updated_at)
+      VALUES (%s, %s, %s, now())
+      ON CONFLICT (tenant_id) DO UPDATE SET status=EXCLUDED.status, error=EXCLUDED.error, updated_at=now();
+      """,
+      (tenant_id, status, error),
+    )
+
+def _get_status(tenant_id: int) -> Tuple[str, Optional[str]]:
+  with get_conn() as conn, conn.cursor() as cur:
+    cur.execute("SELECT status, error FROM onboarding_status WHERE tenant_id=%s", (tenant_id,))
+    row = cur.fetchone()
+    if not row:
+      return (ONBOARDING_PROVISIONING, None)
+    return (row[0], row[1])
+
+def _ensure_tenant_and_user(email: str, tenant_id_claim: Optional[int]) -> int:
+  with get_conn() as conn, conn.cursor() as cur:
+    # If claim exists and tenant row exists, reuse it; else create a new tenant.
+    tid: Optional[int] = None
+    if tenant_id_claim is not None:
+      cur.execute("SELECT tenant_id FROM tenants WHERE tenant_id=%s", (tenant_id_claim,))
+      r = cur.fetchone()
+      if r:
+        tid = r[0]
+    if tid is None:
+      cur.execute("INSERT INTO tenants(name, status) VALUES(%s,'active') RETURNING tenant_id", (email.split("@")[0],))
+      tid = cur.fetchone()[0]
+    # Link user to tenant with default role viewer
+    cur.execute(
+      """
+      INSERT INTO tenant_users(tenant_id, user_id, roles)
+      VALUES (%s, %s, %s)
+      ON CONFLICT (tenant_id, user_id) DO UPDATE SET roles=EXCLUDED.roles
+      """,
+      (tid, email, ["viewer"]),
+    )
+    # Seed ICP template if none exists
+    cur.execute("SELECT 1 FROM icp_rules WHERE tenant_id=%s LIMIT 1", (tid,))
+    if not cur.fetchone():
+      cur.execute(
+        "INSERT INTO icp_rules(tenant_id, name, payload) VALUES (%s, %s, %s)",
+        (tid, "Default ICP", {"industries": ["software"], "employee_range": {"min": 10, "max": 200}}),
+      )
+    return tid
+
+async def _ensure_odoo_mapping(tenant_id: int):
+  base_tpl = os.getenv("ODOO_BASE_DSN_TEMPLATE")
+  default_db = os.getenv("ODOO_DEFAULT_DB_NAME", "odoo")
+  db_name = (base_tpl and f"odoo_tenant_{tenant_id}") or default_db
+  with get_conn() as conn, conn.cursor() as cur:
+    cur.execute(
+      """
+      INSERT INTO odoo_connections(tenant_id, db_name, auth_type, secret, active)
+      VALUES (%s, %s, %s, %s, TRUE)
+      ON CONFLICT (tenant_id) DO UPDATE SET db_name=EXCLUDED.db_name, active=TRUE
+      """,
+      (tenant_id, db_name, "service_account", None),
+    )
+  # Connectivity smoke
+  store = OdooStore(tenant_id=tenant_id)
+  await store.connectivity_smoke_test()
+
+async def handle_first_login(email: str, tenant_id_claim: Optional[int]) -> dict:
+  _ensure_tables()
+  tid = _ensure_tenant_and_user(email, tenant_id_claim)
+  _insert_or_update_status(tid, ONBOARDING_PROVISIONING)
+  try:
+    # Ensure mapping and smoke test
+    await _ensure_odoo_mapping(tid)
+    _insert_or_update_status(tid, ONBOARDING_READY)
+  except Exception as e:
+    _insert_or_update_status(tid, ONBOARDING_ERROR, str(e))
+    return {"tenant_id": tid, "status": ONBOARDING_ERROR, "error": str(e)}
+  return {"tenant_id": tid, "status": ONBOARDING_READY}
+
+def get_onboarding_status(tenant_id: int) -> dict:
+  _ensure_tables()
+  status, error = _get_status(tenant_id)
+  return {"tenant_id": tenant_id, "status": status, "error": error}
+"""
+
+2) File: lead_generation-main/app/odoo_store.py
+
+Append the following method inside class OdooStore:
+
+"""
+    async def connectivity_smoke_test(self) -> None:
+        conn = await self._acquire()
+        try:
+            # Basic connectivity check
+            await conn.execute("SELECT 1")
+            # Optionally check res_partner exists
+            try:
+                await conn.fetchrow("SELECT 1 FROM information_schema.tables WHERE table_name='res_partner'")
+            except Exception:
+                pass
+        finally:
+            await conn.close()
+"""
+
+3) File: lead_generation-main/app/main.py
+
+Add imports and endpoints (showing only additions; place near other routes):
+
+"""
+from fastapi import BackgroundTasks
+from app.onboarding import handle_first_login, get_onboarding_status
+
+@app.post("/onboarding/first_login")
+async def onboarding_first_login(background: BackgroundTasks, claims: dict = Depends(require_auth)):
+    email = claims.get("email") or claims.get("preferred_username")
+    tenant_id_claim = claims.get("tenant_id")
+    # Run provisioning in background to avoid UI blocking
+    async def _run():
+        await handle_first_login(email, tenant_id_claim)
+    background.add_task(_run)
+    return {"status": "provisioning"}
+
+@app.get("/onboarding/status")
+async def onboarding_status(claims: dict = Depends(require_auth)):
+    tid = claims.get("tenant_id")
+    if not tid:
+        # Fallback to request.state.tenant_id if middleware set it
+        # but require_auth enforces presence; this is a guardrail
+        tid = getattr(getattr(app, "state", object()), "tenant_id", None)
+    return get_onboarding_status(int(tid))
+"""
+
+4) File: lead_generation-main/app/migrations/006_onboarding_status.sql
+
+Add new migration:
+
+"""
+CREATE TABLE IF NOT EXISTS onboarding_status (
+  tenant_id INT PRIMARY KEY REFERENCES tenants(tenant_id) ON DELETE CASCADE,
+  status TEXT NOT NULL,
+  error TEXT,
+  updated_at TIMESTAMPTZ DEFAULT now()
+);
+"""
+
+5) File: lead_generation-main/app/migrations/005_tenant_rls.sql
+
+If not already present, add/ensure tenant scoping and policies (idempotent):
+
+"""
+-- Ensure tenant_id columns exist
+ALTER TABLE IF EXISTS lead_scores   ADD COLUMN IF NOT EXISTS tenant_id INT;
+ALTER TABLE IF EXISTS lead_features ADD COLUMN IF NOT EXISTS tenant_id INT;
+
+-- Attach to tenants for FK integrity (optional soft constraint)
+DO $$ BEGIN
+  ALTER TABLE lead_scores   ADD CONSTRAINT fk_lead_scores_tenant   FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id) ON DELETE CASCADE;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  ALTER TABLE lead_features ADD CONSTRAINT fk_lead_features_tenant FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id) ON DELETE CASCADE;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+-- Enable row level security and policy using request.tenant_id GUC
+ALTER TABLE lead_scores   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE lead_features ENABLE ROW LEVEL SECURITY;
+
+CREATE OR REPLACE FUNCTION tenant_id_guc() RETURNS INT AS $$
+BEGIN RETURN NULLIF(current_setting('request.tenant_id', true), '')::INT; END;
+$$ LANGUAGE plpgsql STABLE;
+
+DO $$ BEGIN
+  CREATE POLICY lead_scores_tenant_isolation ON lead_scores
+  USING (tenant_id = tenant_id_guc());
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  CREATE POLICY lead_features_tenant_isolation ON lead_features
+  USING (tenant_id = tenant_id_guc());
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+"""
+
+acra_webhook
+
+- No code changes required for Section 6. Ensure DATABASE_URL is set and base schema applied so staging_acra_companies exists. Health endpoint is /health.
+
+odoo
+
+- No custom code required if using OIDC built-in. Configure OIDC provider with:
+  - Issuer: NEXIUS_ISSUER
+  - Client ID/Secret: NEXIUS_CLIENT_ID / NEXIUS_CLIENT_SECRET (Odoo app registration)
+  - Map ID token claims to include email, tenant_id, roles (custom claim if needed)
+- Optional: If you need to enforce claim mapping, create an Odoo module; otherwise, rely on standard OIDC configuration per lead_generation-main/docs/odoo_oidc_setup.md.
+
+Testing Snippets
+
+UI
+- Set NEXT_PUBLIC_API_BASE=http://localhost:2024, enable SSO envs, run UI and ensure FirstLoginGate transitions to ready.
+
+API
+- With a valid token (mock or real) bearing email and (optionally) tenant_id, call POST /onboarding/first_login then GET /onboarding/status → status ready and odoo_connections row exists.

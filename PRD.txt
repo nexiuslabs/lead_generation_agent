@@ -1,0 +1,246 @@
+6) Multi-Tenant, SSO & Odoo Integration 
+
+Identity, Signup & SSO (Chat UI drives Odoo auto-setup)
+
+Nexius SSO is the identity provider for both the Agent Chat UI (Next.js) and the Odoo system. No external IdPs (e.g., Azure/Okta) are used. External users sign up/login via the Chat UI using Nexius SSO (self-serve allowed). On first successful login, the system auto-provisions their tenant/workspace and Odoo connection (see “First-Login Auto-Provisioning”). 
+
+- Credentials handling: Email and password are entered only on the Nexius SSO domain. The Chat UI never collects or stores passwords and provides no local
+signup/login or password reset. All signup/login flows are OIDC SSO redirects. 
+
+JWT/OIDC tokens issued by Nexius SSO carry: sub, email, tenant_id, roles[], optional odoo_db. Tokens are validated via Nexius SSO JWKS. 
+
+Tenant resolution is via the JWT’s tenant_id claim. For self-serve users, a tenant/workspace is created at first login and bound to the user; no tenant switcher in the UI for external users. 
+
+- Single-tenant users: Login lands them directly in their tenant context. 
+- Multi-tenant users: Select tenant during SSO (organization/tenant choice via Nexius SSO); the resulting token MUST encode the chosen tenant_id. Switching tenants requires re-auth to obtain a token for the other tenant. 
+- Development-only fallback: `X-Tenant-ID` header may be accepted when auth is disabled (never in production). 
+
+LangGraph server 
+
+Validates Nexius SSO JWT (JWKS). Sets tenant_id context for the run based on the validated token; rejects unauthenticated requests in production. 
+
+Applies RLS or strict WHERE filters on tenant_id for tenant-owned tables (icp_rules, lead_scores, lead_features, runs). 
+
+Authorization is role-based via roles[] claim (e.g., admin, ops, viewer). 
+
+Odoo alignment 
+
+- Odoo is configured as an OIDC client of Nexius SSO; the same user session works across Chat UI and Odoo. 
+- Server-to-Odoo sync remains server-side: resolve tenant_id → odoo_connections → connect with a per-tenant service account/API key (never expose to the browser). 
+- Optional: propagate user identity for audit fields where applicable (e.g., created_by) without elevating privileges. 
+
+First-Login Auto-Provisioning (Multi-tenant)
+
+- Trigger: First successful signup/login via Chat UI (Nexius SSO) for a user without an existing tenant/workspace. 
+- Provision tenant/workspace: Create a new tenant_id; persist minimal tenant row and defaults (ICP template, quotas). 
+- Odoo setup: 
+  - If multi-tenant Odoo: create per-tenant database/schema as needed; register service account/API key; insert into `odoo_connections`. 
+  - If single Odoo instance: create company/child records and a scoped service account/API key mapped to tenant; insert into `odoo_connections`. 
+- Create/link Odoo user for the signer’s email with default role(s) aligned to Chat UI roles. 
+- Initial sync: Run connectivity check and seed baseline entities (e.g., res.company/res.partner scaffolding). 
+- Status: Track onboarding status (provisioning → syncing → ready) and surface in UI. 
+
+UI behavior 
+
+- Displays authenticated user and active tenant (from JWT). 
+- First login shows “Setting up your workspace…” while provisioning & initial sync complete. 
+- No tenant switcher for external users; re-auth is required to switch tenants. 
+- Dev/internal builds may include a tenant selector solely for local testing. 
+
+Odoo (per tenant) 
+
+Pre-create/update res.partner (companies & contacts) but no campaign actions in pre-SDR. 
+
+Optional webhooks (email events later). 
+
+Shape 
+
+7) Scheduling & Throughput 
+
+Nightly (SGT): 
+
+Refresh companies from ACRA staging (if new data present). 
+
+Refresh MV icp_candidate_companies per tenant. 
+
+Select daily target set (cap) → domain discovery → enrichment: 
+
+Deterministic crawl (concurrent with per-domain rate-limit). 
+
+Tavily Crawl fallback → merge raw → AI extraction. 
+
+Lusha fallback (if needed). 
+
+ZeroBounce verification (batched). 
+
+Scoring + rationale + persist. 
+
+Odoo pre-create/update companies & contacts (idempotent). 
+
+Duration target: < 90 minutes for 1k shortlisted. 
+
+Shape 
+
+8) Observability, QA & Runbooks 
+
+Metrics (per tenant, per run) 
+
+Candidates pre/post filters, crawl success rate, Tavily fallback rate, Lusha usage count, verified email rate, score distribution, token spend (OpenAI), vendor costs (ZeroBounce/Lusha), latency percentiles. 
+
+Logs & Audit 
+
+Every step logs tenant_id, company_id, tool, args (redacted), status, durations. 
+
+Store merged raw content hash for reproducibility. 
+
+Alerts 
+
+MV refresh failure, crawl error rate > X%, Lusha/ZeroBounce quota errors, OpenAI rate limit, candidate count below floor. 
+
+QA spot checks 
+
+10 random High-bucket entries per run: verify domain, contact validity, rationale coherence. 
+
+Shape 
+
+9) Compliance (PDPA) & Data Handling 
+
+Robots.txt respected; no aggressive scraping. 
+
+Business emails only; suppress personal emails if policy requires (e.g., exclude @gmail.com unless explicit consent). 
+
+Suppression lists respected per tenant (unsubscribe/do-not-contact). 
+
+Retention: raw crawl text optional retention window (e.g., 90 days), logs 180 days, emails per policy. 
+
+Access control: RLS + role checks; PII masked in chat for viewers. 
+
+DSAR/Deletion: Ability to purge tenant data on request. 
+
+Shape 
+
+10) Cost Guardrails 
+
+OpenAI: 
+
+Rationale only (short), reuse via cache key; daily token budget per tenant (hard cap). 
+
+Embeddings only on about_text update (not every run). 
+
+Tavily: use only for fallback; cap pages per domain; stop early on high signal. 
+
+ZeroBounce: verify new emails only; cache results and re-check on cadence (e.g., 90 days). 
+
+Lusha: last-resort fallback; cap per run; store vendor IDs to reuse. 
+
+Shape 
+
+11) Error Handling & Fallbacks 
+
+ICP MV empty → run industry-only fallback and flag run as “degraded.” 
+
+No domain found → go straight to Lusha company search. 
+
+Crawler blocked / thin content → Tavily; if still thin → Lusha for contacts. 
+
+ZeroBounce API error → mark emails status=unknown, retry next run. 
+
+Lusha quota → proceed without contacts; lower the score weight for contacts to avoid biasing High incorrectly. 
+
+Shape 
+
+12) UX — Agent Chat UI (Next.js) 
+
+SSO login → tenant context visible in header (and switcher when applicable). 
+
+Commands (plain English): 
+
+“Refresh ICP to software, 10–200 employees; run nightly.” 
+
+“Show today’s shortlist (top 50).” 
+
+“Explain why company X is High.” 
+
+“Re-enrich Codigo; include careers page.” 
+
+Streaming progress events (crawl → merge → extract → verify → score). 
+
+Export shortlist (CSV/JSON). 
+
+Guard by roles: ops can update ICP; viewer read-only. 
+
+Shape 
+
+13) Rollout Plan & Milestones 
+
+M1 (Week 1): ICP rules JSON (optional keys), MV creation + nightly refresh, tenant scaffolding & RLS. 
+
+M2 (Week 2): Deterministic crawler + storage; fallback to Tavily multi-URL raw + merged content; AI extraction mapping; idempotent upserts. 
+
+M3 (Week 3): ZeroBounce integration & caching; scoring thresholds; rationale cache; shortlist cap; basic dashboards. 
+
+M3.5 (Week 3.5): First-login auto-provisioning (tenant + Odoo + initial sync) GA. 
+
+M4 (Week 4): Lusha fallback; rate limiting; vendor quota guards; contact mapping to lead_emails. 
+
+M5 (Week 5): Agent Chat UI SSO; tenant switcher; SSE; role-based commands. 
+
+M6 (Week 6): Odoo pre-create/update for companies & contacts; runbooks; SLAs; DR docs. 
+
+M7 (Week 7): Pilot with 2 tenants; measure KPIs; tune thresholds; finalize budgets. 
+
+Shape 
+
+14) Acceptance Criteria (Pre-SDR) 
+
+Nightly job produces a shortlist with ≥ 500 MV candidates available globally; per tenant daily cap delivered on schedule. 
+
+Each shortlisted company has: domain (≥70%), about_text (≥60%), ≥1 verified/unknown business email (≥40% of companies). 
+
+Score buckets respect thresholds and distribution sanity (no bucket > 70% of total). 
+
+Rationale present and cache reused (>80% hit on repeated features). 
+
+Multi-tenant isolation verified (RLS tests) and SSO works end-to-end. 
+
+Lusha is only invoked when website/contacts missing; costs & call counts logged. 
+
+Observability dashboards show: counts, durations, error rates, vendor usage, token spend. 
+
+PDPA/robots compliance documented; suppression/respect lists enforced. 
+
+Shape 
+
+- First-login to “ready” (Odoo connection verified) ≤ 60s p95; failures surface actionable error states. 
+- `odoo_connections` row exists and passes a read/write smoke test per new tenant. 
+
+SSO (Nexius SSO across Chat UI + Odoo) 
+
+- Sign-in required: Access to Chat UI and Odoo requires Nexius SSO login; no unauthenticated access in production. 
+- Single sign-on: One successful login session grants access to both apps (same browser context), within token/session lifetimes. 
+- Tenant resolution: JWT includes tenant_id; UI presents no tenant switcher. Switching tenants requires re-auth to obtain a token for the other tenant. 
+- Token validation: LangGraph server validates Nexius SSO JWT (JWKS); invalid/expired tokens are rejected. `X-Tenant-ID` header is ignored in production. 
+- Roles enforced: roles[] claim maps to app permissions (admin/ops/viewer). Unauthorized actions are blocked (e.g., ICP updates restricted to ops/admin). 
+- Token lifecycle: Refresh/renew does not break active usage; streaming reconnects acquire fresh Authorization headers. 
+- Logout: Signing out terminates access to both apps; re-login required. 
+- Odoo OIDC: Odoo accepts Nexius SSO tokens and reflects the same identity. 
+- Auditing: Server-side writes tag tenant_id and user (sub/email) where applicable. 
+- Transport security: HTTPS enforced; secure cookies and appropriate SameSite/CSRF protections in place. 
+
+15) Open Questions / Decisions 
+
+Title targeting for contacts (default set vs. per-tenant config)? 
+
+Do we exclude free-mail domains entirely or allow with low confidence? 
+
+Exact nightly window per tenant (stagger to smooth vendor quotas)? 
+
+Retention period for merged raw content (90/180/365 days)? 
+
+When to push to Odoo in pre-SDR: immediately nightly or on operator approval in Chat UI? 
+
+Shape 
+
+TL;DR 
+
+This pre-SDR PRD delivers a deterministic, compliant, multi-tenant pipeline that ingests, filters by flexible ICPs, enriches with web + Tavily + Lusha fallbacks, verifies emails, scores & explains, and hands a ranked shortlist to SDR/RevOps—wired to your Agent Chat UI (SSO) and ready for Odoo sync (no sequencing yet). 
