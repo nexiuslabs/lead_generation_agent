@@ -1,0 +1,223 @@
+DEV PLAN — Pre-SDR Lead Generation (Aligned to PRD and Current Codebases)
+
+Scope
+- Deliver a deterministic, compliant, multi-tenant pre-SDR pipeline that ingests ACRA → selects candidates via flexible ICP rules → enriches (deterministic crawl + Tavily + Lusha) → verifies (ZeroBounce) → scores with rationale → exports and (optionally) syncs to Odoo.
+- Build on existing repos: lead_generation-main (LangGraph/FastAPI pipeline), acra_webhook (ACRA staging ingester), agent-chat-ui (Next.js chat to LangGraph). Respect schema_PosgresDB.sql and app migrations under lead_generation-main/app/migrations.
+
+Repository Map
+- lead_generation-main: Core pipeline, FastAPI + LangServe graph (/agent), orchestrator CLI, enrichment (crawler/Tavily/Lusha/ZeroBounce), ICP utilities, Odoo store, migrations (incl. multi-tenant).
+- acra_webhook: FastAPI + APScheduler job to ingest ACRA dataset into staging_acra_companies.
+- agent-chat-ui: Next.js UI to talk to LangGraph servers (streams); needs light customization for tenant header and later SSO.
+
+Environment & Bootstrap
+- Postgres up with schema_PosgresDB.sql applied.
+- Apply app migrations from lead_generation-main/app/migrations (esp. 004_multi_tenant_icp.sql, 001_presdr_odoo.sql if Odoo sync used).
+- Env vars (representative):
+  - POSTGRES_DSN, ODOO_POSTGRES_DSN
+  - OPENAI_API_KEY, LANGCHAIN_MODEL=gpt-4o-mini, TEMPERATURE=0.3
+  - TAVILY_API_KEY (optional), ZEROBOUNCE_API_KEY (optional), LUSHA_API_KEY (optional)
+  - ICP_RULE_NAME=default, CRAWL_MAX_PAGES=6, EXTRACT_CORPUS_CHAR_LIMIT=35000
+  - For acra_webhook: DATABASE_URL, API_URL, RESOURCE_ID, PAGE_SIZE, DISABLE_SCHEDULER/INTERVAL if needed
+
+Phase M1 — Tenancy Scaffolding + ICP Candidate View
+1) Apply Multi-Tenant Migration
+- Run lead_generation-main/app/migrations/004_multi_tenant_icp.sql to create:
+  - tenants, tenant_users, odoo_connections, icp_rules(tenant_id), MV icp_candidate_companies
+
+2) Minimal Tenancy Wiring (Header-based)
+- Server already reads header X-Tenant-ID (lead_generation-main/app/main.py). For ICP, store rules per-tenant in icp_rules and use MV to derive candidates.
+- Example insert (SQL):
+  INSERT INTO tenants(name) VALUES ('Acme') RETURNING tenant_id;
+  INSERT INTO icp_rules(tenant_id, name, payload) VALUES (
+    1, 'default', '{"industries": ["technology"], "employee_range": {"min":2, "max":100}, "incorporation_year": {"min":2000, "max":2025}}'::jsonb
+  );
+  REFRESH MATERIALIZED VIEW CONCURRENTLY icp_candidate_companies;
+
+3) Orchestrator Run (baseline)
+- lead_generation-main/src/orchestrator.py already performs: normalize → refresh_icp → enrich → lead scoring → output.
+- Command:
+  cd lead_generation-main
+  . .venv/bin/activate  # if configured
+  python -m src.orchestrator
+
+Deliverables M1
+- MV refreshed and candidate_ids observable in logs.
+- Header tenancy in place (no SSO yet). UI can pass X-Tenant-ID via proxy for testing.
+
+Phase M2 — Deterministic Crawler + Tavily Fallback + Persistent Audit
+Status: Mostly implemented in src/crawler.py and src/enrichment.py.
+Tasks
+- Ensure deterministic crawl persists summaries to summaries table and optional merged content to storage flags (PERSIST_CRAWL_PAGES, PERSIST_CRAWL_CORPUS).
+- Validate robots.txt compliance (RobotsCache in crawler) and per-domain page caps (CRAWL_MAX_PAGES).
+- Confirm enrichment writes to company_enrichment_runs via flexible insert (present); ensure enrichment_runs row is created when run_id is required.
+
+Code Notes
+- Deterministic crawl entry: await crawl_site(url, max_pages=CRAWLER_MAX_PAGES)
+- Merge deterministic signals into AI extraction path: _merge_with_deterministic in enrichment.py
+
+Phase M3 — Contacts & Email Verification (ZeroBounce) + Lusha Fallback
+Status: Implemented with caching and toggles; wire env and guardrails.
+Tasks
+- Set ZEROBOUNCE_API_KEY; verification cache table created automatically (email_verification_cache). Keep EXTRACT_CORPUS_CHAR_LIMIT and verify only new emails.
+- Lusha: ENABLE_LUSHA_FALLBACK=true; set LUSHA_PREFERRED_TITLES in env if needed.
+
+Code Excerpts
+- ZeroBounce call site (enrichment.py): validate in batch; results cached, status unknown on API failure.
+- Lusha client (src/lusha_client.py) with async client; upserts into contacts and mirrors to lead_emails when present.
+
+Phase M4 — Lead Scoring + Rationale + Export
+Status: Implemented (src/lead_scoring.py + openai_client.py; /export/latest_scores.csv endpoint in app/main.py).
+Tasks
+- Tune scoring thresholds in assign_buckets; ensure rationale generation short/system-prompted; reuse cache_key where added.
+- Validate CSV export at /export/latest_scores.csv.
+
+Phase M5 — Scheduling & Nightly Orchestration
+Goal: Nightly (SGT) end-to-end run producing capped shortlist.
+Tasks
+- Option A (simple): Cron to run orchestrator script.
+  Example (crontab, SGT):
+  0 1 * * * cd /path/to/lead_generation-main && /usr/bin/env PATH=$PATH:/path/to/.venv/bin \ 
+    /path/to/.venv/bin/python -m src.orchestrator >> .logs/nightly.log 2>&1
+- Option B: APScheduler within app (similar to acra_webhook) firing an async task; keep isolated to avoid blocking API.
+
+Shortlist Cap & Persistence
+- After scoring, persist cap per tenant (e.g., insert into a shortlist table or mark in lead_scores with a run_id). If adding:
+  CREATE TABLE IF NOT EXISTS shortlist_runs (
+    run_id bigserial PRIMARY KEY, tenant_id int, created_at timestamptz default now()
+  );
+  ALTER TABLE lead_scores ADD COLUMN IF NOT EXISTS run_id bigint;
+  CREATE INDEX IF NOT EXISTS idx_lead_scores_run ON lead_scores(run_id);
+
+Phase M6 — SSO & Auth (JWT/JWKS) + Tenant Switcher
+Status: Not implemented. Plan uses JWT with claims {sub, email, tenant_id, roles[]}.
+
+Server: JWT Verification (FastAPI dependency)
+Python (new module app/auth.py):
+  import time, httpx, jwt
+  from functools import lru_cache
+  from fastapi import HTTPException, Depends, Request
+
+  ISSUER = os.getenv('OIDC_ISSUER')
+  AUD = os.getenv('OIDC_AUDIENCE')
+  @lru_cache(maxsize=1)
+  def _jwks():
+      url = f"{ISSUER}/.well-known/jwks.json"
+      return httpx.get(url, timeout=5).json()
+
+  def verify_jwt(token: str) -> dict:
+      try:
+          return jwt.decode(token, key=_jwks(), algorithms=['RS256'], audience=AUD, options={"verify_aud": bool(AUD)})
+      except jwt.PyJWTError as e:
+          raise HTTPException(status_code=401, detail=str(e))
+
+  async def auth_ctx(request: Request) -> dict:
+      auth = request.headers.get('Authorization','')
+      if auth.startswith('Bearer '):
+          claims = verify_jwt(auth[7:])
+          request.state.tenant_id = claims.get('tenant_id') or request.headers.get('X-Tenant-ID')
+          request.state.roles = claims.get('roles', [])
+          return claims
+      # fallback for dev
+      request.state.tenant_id = request.headers.get('X-Tenant-ID')
+      request.state.roles = []
+      return {}
+
+FastAPI usage (app/main.py):
+  from app.auth import auth_ctx
+  @app.get('/info')
+  async def info(_: dict = Depends(auth_ctx)):
+      return {"ok": True}
+
+UI: Tenant Switcher + Header Injection
+- agent-chat-ui uses langgraph SDK; extend request to add X-Tenant-ID.
+TypeScript (Stream.tsx – add header):
+  const streamValue = useTypedStream({
+    apiUrl,
+    apiKey: apiKey ?? undefined,
+    assistantId,
+    fetchOptions: { headers: tenantId ? { 'X-Tenant-ID': tenantId } : {} },
+    ...
+  });
+- Add a simple settings component to set tenantId in localStorage and update context.
+
+SSO in UI (later):
+- Integrate NextAuth or provider SDK (Auth0/Okta/Azure AD/Keycloak). On session, attach Authorization: Bearer <id_token> to API requests; server validates JWT and maps tenant_id/roles.
+
+Phase M7 — RLS & Tenantized Writes
+Observation: Current base tables lack tenant_id; MV icp_candidate_companies uses icp_rules. For strict RLS, add tenant_id to tenant-owned tables (rules, scores/features, runs). Keep global entities (companies, contacts) shared.
+
+SQL Migration (tenant columns + policies):
+  ALTER TABLE lead_scores ADD COLUMN IF NOT EXISTS tenant_id INT;
+  ALTER TABLE lead_features ADD COLUMN IF NOT EXISTS tenant_id INT;
+  ALTER TABLE enrichment_runs ADD COLUMN IF NOT EXISTS tenant_id INT;
+  -- Optional: summaries per-tenant view
+
+  -- Example RLS on lead_scores
+  ALTER TABLE lead_scores ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY lead_scores_tenant_isolation ON lead_scores
+    USING (tenant_id::text = current_setting('request.tenant_id', true));
+
+  -- Set at session start in app (per-request):
+  with conn.cursor() as cur:
+    cur.execute("SELECT set_config('request.tenant_id', %s, true)", (tenant_id,))
+
+Server write path updates (Python)
+- When inserting/updating lead_scores/features/enrichment_runs, include tenant_id from request.state.tenant_id.
+
+Phase M8 — Observability & Cost Guardrails
+Metrics Endpoint (Prometheus):
+  pip install prometheus-client
+  from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+  crawl_errors = Counter('crawl_errors_total','Crawl errors')
+  @app.get('/metrics')
+  def metrics():
+      return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+Token/Cost Budgets
+- Add env DAILY_TOKEN_BUDGET per tenant (store in tenants or config). Gate LLM calls in generate_rationale/extract path:
+  if remaining_budget(tenant_id) <= 0: skip rationale; write note in rationale field.
+
+Vendor Quotas
+- Track Lusha/ZeroBounce call counts per run; add guards in enrichment to short-circuit beyond caps.
+
+Phase M9 — Compliance & Suppressions
+Suppression Lists
+  CREATE TABLE IF NOT EXISTS suppression_emails (
+    tenant_id INT, email TEXT PRIMARY KEY, reason TEXT, updated_at timestamptz default now()
+  );
+Filter on insert to contacts/lead_emails and on export queries.
+
+Retention Jobs
+- Add cron to purge summaries older than N days (configurable), and email_verification_cache recheck ≥90 days.
+
+Phase M10 — Odoo Sync Hardening
+Status: odoo_store.py available; sync happens in pre_sdr_graph.
+Tasks
+- Ensure ODOO_POSTGRES_DSN is set and SSH tunnel optional. Confirm mapping to res_partner/crm_lead (001_presdr_odoo.sql).
+- Add retry/backoff and per-tenant connection from odoo_connections table.
+
+Operational Runbooks
+- ACRA Ingestion: cd acra_webhook && uvicorn main:app --reload; verify /health. Scheduler config in env.
+- Graph API: cd lead_generation-main && uvicorn app.main:app --reload; verify /agent and /export/latest_scores.csv.
+- Nightly orchestration: run orchestrator via cron or k8s job; check .logs.
+- UI: cd agent-chat-ui && pnpm dev; set NEXT_PUBLIC_API_URL to LangGraph server; set tenant in UI settings.
+
+Testing & Acceptance
+- Unit: src/icp.py normalization + selection; src/crawler deterministic signals; enrichment merges; lead_scoring thresholds.
+- Integration: Run orchestrator against a test DB snapshot; verify candidate count, enrich outputs, email verification cache behavior, Lusha fallback.
+- Acceptance (from PRD): shortlist size/distribution, data completeness thresholds, limited vendor use, header-based isolation; later SSO + RLS.
+
+Backlog & Open Decisions
+- Per-tenant title targeting for contacts.
+- Free-mail policy (exclude vs low-confidence include).
+- Stagger nightly windows per-tenant for quota smoothing.
+- Retention window for merged raw content (90/180/365 days).
+- Push to Odoo automatically vs operator-approved in UI.
+
+Quick Commands Reference
+- Apply DB schema: psql "$POSTGRES_DSN" -f schema_PosgresDB.sql
+- Apply app migrations: psql "$POSTGRES_DSN" -f lead_generation-main/app/migrations/004_multi_tenant_icp.sql
+- Start Graph API: uvicorn app.main:app --host 0.0.0.0 --port 2024
+- Orchestrator (one-off): python -m src.orchestrator
+- ACRA webhook: uvicorn main:app --reload  # in acra_webhook
+

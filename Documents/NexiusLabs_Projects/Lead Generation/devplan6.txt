@@ -1,0 +1,267 @@
+DEV PLAN — Section 6: Multi‑Tenant, SSO & Odoo Integration
+
+Goal
+- Single Sign-On (SSO) via Nexius SSO for BOTH the Agent Chat UI (Next.js) and Odoo.
+- No tenant switcher for external users; tenant is resolved from JWT claim tenant_id.
+- FastAPI server validates Nexius SSO tokens, enforces per‑tenant isolation with RLS/filters, and uses per‑tenant Odoo connections.
+
+Codebases Affected
+- agent-chat-ui (Next.js): Add SSO, inject Authorization and X-Tenant-ID, remove tenant switcher in prod.
+- lead_generation-main (FastAPI/LangGraph): Add JWT verification, set tenant context, RLS, and per‑tenant Odoo connection usage.
+- acra_webhook (FastAPI): No SSO changes (ingestion service); optional: add health/auth guard for admin endpoints.
+- Odoo (external configuration): Configure OIDC client with Nexius SSO (no code in this repo; ops step).
+
+Environments (shared)
+- Nexius SSO (OIDC): NEXIUS_ISSUER, NEXIUS_CLIENT_ID, NEXIUS_CLIENT_SECRET, NEXIUS_AUDIENCE (optional), JWKS available at `${NEXIUS_ISSUER}/.well-known/jwks.json`.
+- JWT claims required: sub, email, tenant_id, roles[] (optional: odoo_db).
+- Production: HTTPS only, secure cookies, CORS restricted to UI origin.
+
+========================================
+agent-chat-ui — Next.js SSO & Headers
+========================================
+
+Objectives
+- Require SSO sign‑in for external users via Nexius SSO (NextAuth custom OIDC provider).
+- Inject Authorization: Bearer <id_token> and X-Tenant-ID (from token’s tenant_id) on all graph requests.
+- Remove tenant switcher in production; keep optional dev override.
+
+Env
+- NEXTAUTH_URL, NEXTAUTH_SECRET
+- NEXIUS_ISSUER, NEXIUS_CLIENT_ID, NEXIUS_CLIENT_SECRET
+- NEXT_PUBLIC_API_URL (LangGraph server URL), NEXT_PUBLIC_ASSISTANT_ID
+- NEXT_PUBLIC_ENABLE_TENANT_SWITCHER=false (prod), true (dev if needed)
+
+1) Add NextAuth OIDC (Nexius SSO)
+- File: src/app/api/auth/[...nextauth]/route.ts
+  import NextAuth from "next-auth";
+  import { Issuer } from "openid-client";
+  import { OAuthConfig } from "next-auth/providers";
+
+  async function NexiusProvider(): Promise<OAuthConfig<any>> {
+    const issuer = await Issuer.discover(process.env.NEXIUS_ISSUER!);
+    return {
+      id: "nexius",
+      name: "Nexius",
+      type: "oauth",
+      version: "2.0",
+      checks: ["pkce", "state"],
+      authorization: { params: { scope: "openid profile email" } },
+      clientId: process.env.NEXIUS_CLIENT_ID!,
+      clientSecret: process.env.NEXIUS_CLIENT_SECRET!,
+      issuer: issuer.issuer,
+      wellKnown: `${issuer.issuer}/.well-known/openid-configuration`,
+      idToken: true,
+      profile(profile) {
+        return { id: profile.sub, email: profile.email } as any;
+      },
+    } as OAuthConfig<any>;
+  }
+
+  const handler = NextAuth({
+    providers: [await NexiusProvider()],
+    callbacks: {
+      async jwt({ token, account, profile }) {
+        if (account?.id_token) token.id_token = account.id_token;
+        if (profile) {
+          (token as any).tenant_id = (profile as any).tenant_id ?? (profile as any)["https://claims/tenant_id"] ?? null;
+          (token as any).roles = (profile as any).roles ?? (profile as any)["https://claims/roles"] ?? [];
+        }
+        return token;
+      },
+      async session({ session, token }) {
+        (session as any).idToken = (token as any).id_token;
+        (session as any).tenantId = (token as any).tenant_id ?? null;
+        (session as any).roles = (token as any).roles ?? [];
+        return session;
+      },
+    },
+    session: { strategy: "jwt" },
+    trustHost: true,
+  });
+  export { handler as GET, handler as POST };
+
+2) Wrap app with SessionProvider and gate pages
+- File: src/app/layout.tsx or a top-level provider
+  import { SessionProvider } from "next-auth/react";
+  export default function RootLayout({ children }) {
+    return <SessionProvider>{children}</SessionProvider>;
+  }
+
+- Gate the chat route: if unauthenticated, redirect to /api/auth/signin.
+
+3) Inject Authorization and X-Tenant-ID on stream requests
+- File: src/providers/Stream.tsx (augment existing)
+  import { useSession } from "next-auth/react";
+  const { data: session } = useSession();
+  const idToken = (session as any)?.idToken as string | undefined;
+  const tenantId = (session as any)?.tenantId as string | undefined;
+  const streamValue = useTypedStream({
+    apiUrl,
+    assistantId,
+    fetchOptions: {
+      headers: {
+        ...(tenantId ? { 'X-Tenant-ID': tenantId } : {}),
+        ...(idToken ? { 'Authorization': `Bearer ${idToken}` } : {}),
+      },
+    },
+    ...
+  });
+
+4) Ensure API passthrough forwards auth headers (if used)
+- File: src/app/api/[..._path]/route.ts
+  - If using langgraph-nextjs-api-passthrough, verify it keeps incoming Authorization/X-Tenant-ID.
+  - If not, implement a small proxy that forwards those headers to the LangGraph server.
+
+5) Remove tenant switcher in prod
+- Feature flag: if process.env.NEXT_PUBLIC_ENABLE_TENANT_SWITCHER !== 'true', hide any selector and rely solely on JWT tenant_id.
+
+========================================
+lead_generation-main — Auth, Tenancy, RLS, Odoo per‑tenant
+========================================
+
+Objectives
+- Validate Nexius SSO JWT on every request; reject unauthenticated in prod.
+- Set tenant context from JWT; enforce per‑tenant isolation on tenant‑owned tables via RLS/filters.
+- Use per‑tenant Odoo DSN from odoo_connections.
+
+Env
+- NEXIUS_ISSUER, NEXIUS_AUDIENCE (optional), POSTGRES_DSN
+
+1) Add JWT verification
+- New file: app/auth.py
+  import os, time, httpx, jwt
+  from functools import lru_cache
+  from fastapi import HTTPException, Depends, Request
+
+  ISSUER = os.getenv('NEXIUS_ISSUER')
+  AUD = os.getenv('NEXIUS_AUDIENCE')
+
+  @lru_cache(maxsize=1)
+  def _jwks():
+      url = f"{ISSUER}/.well-known/jwks.json"
+      return httpx.get(url, timeout=5).json()
+
+  def verify_jwt(token: str) -> dict:
+      try:
+          return jwt.decode(token, key=_jwks(), algorithms=['RS256'], audience=AUD, options={"verify_aud": bool(AUD)})
+      except jwt.PyJWTError as e:
+          raise HTTPException(status_code=401, detail=str(e))
+
+  async def require_auth(request: Request) -> dict:
+      auth = request.headers.get('Authorization','')
+      if not auth.startswith('Bearer '):
+          raise HTTPException(status_code=401, detail='Missing bearer token')
+      claims = verify_jwt(auth[7:])
+      request.state.tenant_id = claims.get('tenant_id')
+      request.state.roles = claims.get('roles', [])
+      if not request.state.tenant_id:
+          raise HTTPException(status_code=403, detail='Missing tenant_id claim')
+      return claims
+
+2) Enforce auth + set DB GUC for RLS
+- File: app/main.py (register dependency / middleware)
+  from fastapi import Depends
+  from app.auth import require_auth
+  from src.database import get_conn
+
+  @app.middleware("http")
+  async def set_tenant_guc(request, call_next):
+      # Allow health unauthenticated; guard others via route-level Depends(require_auth)
+      response = await call_next(request)
+      return response
+
+  # Example protected route
+  @app.get('/info')
+  async def info(_: dict = Depends(require_auth)):
+      return {"ok": True}
+
+  # When opening DB sessions per-request, set GUC:
+  with get_conn() as conn, conn.cursor() as cur:
+      cur.execute("SELECT set_config('request.tenant_id', %s, true)", (request.state.tenant_id,))
+
+3) Tenant columns + RLS policies
+- Migration (SQL):
+  ALTER TABLE lead_scores   ADD COLUMN IF NOT EXISTS tenant_id INT;
+  ALTER TABLE lead_features ADD COLUMN IF NOT EXISTS tenant_id INT;
+  ALTER TABLE enrichment_runs ADD COLUMN IF NOT EXISTS tenant_id INT;
+  -- Enable RLS
+  ALTER TABLE lead_scores ENABLE ROW LEVEL SECURITY;
+  ALTER TABLE lead_features ENABLE ROW LEVEL SECURITY;
+  ALTER TABLE enrichment_runs ENABLE ROW LEVEL SECURITY;
+  -- Policies (expect GUC request.tenant_id set)
+  CREATE POLICY lead_scores_isolation ON lead_scores USING (tenant_id::text = current_setting('request.tenant_id', true));
+  CREATE POLICY lead_features_isolation ON lead_features USING (tenant_id::text = current_setting('request.tenant_id', true));
+  CREATE POLICY enrichment_runs_isolation ON enrichment_runs USING (tenant_id::text = current_setting('request.tenant_id', true));
+
+4) Write paths: include tenant_id
+- Where inserting/updating lead_scores, lead_features, enrichment_runs, ensure tenant_id=request.state.tenant_id is populated.
+- If current code does not persist lead_scores/features via the API server, add a small service function to upsert with tenant_id and call from the graph.
+
+5) Per‑tenant Odoo connection
+- Change app/odoo_store.py to accept tenant_id and resolve DSN from app DB (odoo_connections):
+  class OdooStore:
+      def __init__(self, tenant_id: int, dsn: str | None = None):
+          if dsn:
+              self.dsn = dsn
+          else:
+              # fetch per-tenant DSN from app DB
+              import psycopg2
+              from src.settings import POSTGRES_DSN
+              with psycopg2.connect(dsn=POSTGRES_DSN) as c, c.cursor() as cur:
+                  cur.execute("SELECT db_name FROM odoo_connections WHERE tenant_id=%s AND active", (tenant_id,))
+                  row = cur.fetchone()
+                  if not row:
+                      raise RuntimeError("No Odoo connection for tenant")
+                  # construct DSN using env template + db_name; or store full DSN in table
+                  self.dsn = os.getenv('ODOO_BASE_DSN_TEMPLATE', '').format(db_name=row[0])
+          self._ensure_tunnel_once()
+
+- Update callers (app/pre_sdr_graph.py):
+  tenant_id = request.state.tenant_id
+  store = OdooStore(tenant_id)
+  await store.upsert_company(...)
+
+6) Strict auth in prod
+- Disable legacy header fallback in production: only accept X-Tenant-ID in dev/testing.
+
+========================================
+acra_webhook — Ingestion service
+========================================
+
+Objectives
+- No SSO required (non-user-facing). Keep /health open. Optionally protect admin endpoints with basic auth if added later.
+- No tenant logic: staging_acra_companies remains global.
+
+========================================
+Odoo — OIDC client configuration (Ops)
+========================================
+
+Objectives
+- Configure Odoo as an OIDC client of Nexius SSO so that the same SSO session applies across Chat UI and Odoo.
+
+Steps (high level)
+- In Nexius SSO: register Odoo application (redirect URI per Odoo), assign claims tenant_id, roles to tokens.
+- In Odoo: enable OAuth / OpenID Connect module, set Issuer = NEXIUS_ISSUER, client_id/secret.
+- Test: Login to Odoo via Nexius SSO; verify token contains tenant_id and roles and audit fields reflect user identity as needed.
+
+========================================
+Testing & Acceptance (Section 6)
+========================================
+
+Smoke
+- agent-chat-ui: unauthenticated user is redirected to Nexius SSO login; after login, chat loads and streams.
+- lead_generation-main: protected routes reject missing/invalid tokens; /info returns ok with valid token.
+
+Tenant Isolation
+- Insert two tenants and rules; ensure lead_scores/features/enrichment_runs include tenant_id and RLS blocks cross-tenant reads.
+- DB session GUC set per request; direct SQL attempts without GUC do not return tenant rows.
+
+Odoo
+- Given odoo_connections for tenant A, sync writes to tenant A’s Odoo DB. Switching account (re-auth) to tenant B uses B’s Odoo connection.
+
+Security
+- HTTPS enforced end-to-end; Authorization header present on all requests; no tenant switcher visible in production builds.
+
+Rollout
+- Enable in staging with 1–2 tenants; verify cross-app SSO, isolation, and Odoo sync. Then promote to production.
+
